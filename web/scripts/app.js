@@ -4,7 +4,7 @@ import { api } from "./api.js";
 import { defaultGraph } from "./defaultGraph.js";
 import { getPngMetadata, importA1111, getLatentMetadata } from "./pnginfo.js";
 
-/** 
+/**
  * @typedef {import("types/comfy").ComfyExtension} ComfyExtension
  */
 
@@ -43,6 +43,12 @@ export class ComfyApp {
 		 * @type {Record<string, any>}
 		 */
 		this.nodeOutputs = {};
+
+		/**
+		 * Stores the grid data for each node
+		 * @type {Record<string, any>}
+		 */
+		this.nodeGrids = {};
 
 		/**
 		 * Stores the preview image data for each node
@@ -132,7 +138,7 @@ export class ComfyApp {
 					}
 
 					if(app.nodeOutputs[node.id + ""])
-						app.nodeOutputs[node.id + ""].images = node.images;
+						app.nodeOutputs[node.id + ""] = [{ images: node.images }];
 				}
 
 				if(ComfyApp.clipspace.imgs) {
@@ -393,12 +399,14 @@ export class ComfyApp {
 				let imgURLs = []
 				let imagesChanged = false
 
-				const output = app.nodeOutputs[this.id + ""];
-				if (output && output.images) {
-					if (this.images !== output.images) {
-						this.images = output.images;
+				const outputBatches = app.nodeOutputs[this.id + ""];
+				if (outputBatches) {
+					if (this.images !== outputBatches) {
+						this.images = outputBatches;
+						const allImages = outputBatches.filter(batch => Array.isArray(batch.images))
+													   .flatMap(batch => batch.images)
 						imagesChanged = true;
-						imgURLs = imgURLs.concat(output.images.map(params => {
+						imgURLs = imgURLs.concat(allImages.map(params => {
 							return "/view?" + new URLSearchParams(params).toString() + app.getPreviewFormatParam();
 						}))
 					}
@@ -426,7 +434,7 @@ export class ComfyApp {
 								});
 							})
 						).then((imgs) => {
-							if ((!output || this.images === output.images) && (!preview || this.preview === preview)) {
+							if ((!outputBatches || this.images === outputBatches) && (!preview || this.preview === preview)) {
 								this.imgs = imgs.filter(Boolean);
 								this.setSizeForImage?.();
 								app.graph.setDirtyCanvas(true);
@@ -448,8 +456,6 @@ export class ComfyApp {
 						this.pointerDown = null;
 					}
 
-					let w = this.imgs[0].naturalWidth;
-					let h = this.imgs[0].naturalHeight;
 					let imageIndex = this.imageIndex;
 					const numImages = this.imgs.length;
 					if (numImages === 1 && !imageIndex) {
@@ -463,6 +469,8 @@ export class ComfyApp {
 					dh -= shiftY;
 
 					if (imageIndex == null) {
+						let w = this.imgs[0].naturalWidth;
+						let h = this.imgs[0].naturalHeight;
 						let best = 0;
 						let cellWidth;
 						let cellHeight;
@@ -530,6 +538,8 @@ export class ComfyApp {
 						}
 					} else {
 						// Draw individual
+						let w = this.imgs[imageIndex].naturalWidth;
+						let h = this.imgs[imageIndex].naturalHeight;
 						const scaleX = dw / w;
 						const scaleY = dh / h;
 						const scale = Math.min(scaleX, scaleY, 1);
@@ -880,9 +890,28 @@ export class ComfyApp {
 				ctx.globalAlpha = 1;
 			}
 
-			if (self.progress && node.id === +self.runningNodeId) {
-				ctx.fillStyle = "green";
-				ctx.fillRect(0, 0, size[0] * (self.progress.value / self.progress.max), 6);
+			if (node.id === +self.runningNodeId) {
+				if (self.progress) {
+					let offset = 0
+					let height = 6;
+
+					if (self.batchProgress) {
+						offset = 4;
+						height = 4;
+					}
+
+					ctx.fillStyle = "green";
+					ctx.fillRect(0, offset, size[0] * (self.progress.value / self.progress.max), height);
+
+					if (self.batchProgress) {
+						ctx.fillStyle = "#3ca2c3";
+						ctx.fillRect(0, 0, size[0] * (self.batchProgress.value / self.batchProgress.max), height);
+					}
+				}
+				else if (self.batchProgress) {
+					ctx.fillStyle = "#3ca2c3";
+					ctx.fillRect(0, 0, size[0] * (self.batchProgress.value / self.batchProgress.max), 6);
+				}
 				ctx.fillStyle = bgcolor;
 			}
 
@@ -943,23 +972,52 @@ export class ComfyApp {
 			this.graph.setDirtyCanvas(true, false);
 		});
 
+		api.addEventListener("batch_progress", ({ detail }) => {
+			if (detail.total_batches <= 1) {
+				this.batchProgress = null;
+			}
+			else {
+				this.batchProgress = {
+					value: detail.batch_num,
+					max: detail.total_batches
+				}
+			}
+			this.graph.setDirtyCanvas(true, false);
+		});
+
 		api.addEventListener("executing", ({ detail }) => {
 			this.progress = null;
-			this.runningNodeId = detail;
+			this.batchProgress = null;
+			this.runningNodeId = detail.node;
 			this.graph.setDirtyCanvas(true, false);
-			delete this.nodePreviewImages[this.runningNodeId]
+			if (detail.node != null) {
+				delete this.nodePreviewImages[this.runningNodeId]
+			}
+			else {
+				this.runningPrompt = null;
+			}
 		});
 
 		api.addEventListener("executed", ({ detail }) => {
-			this.nodeOutputs[detail.node] = detail.output;
-			const node = this.graph.getNodeById(detail.node);
-			if (node) {
-				if (node.onExecuted)
-					node.onExecuted(detail.output);
+			if (detail.batch_num === detail.total_batches) {
+				this.nodeOutputs[detail.node] = detail.output;
+				if (detail.output != null) {
+					this.nodeGrids[detail.node] = this.#resolveGrid(detail.node, detail.output, this.runningPrompt)
+				}
+				const node = this.graph.getNodeById(detail.node);
+				if (node) {
+					if (node.onExecuted)
+						node.onExecuted(detail.output);
+				}
+			}
+			if (this.batchProgress != null) {
+				this.batchProgress.value = detail.batch_num
+				this.batchProgress.max = detail.total_batches
 			}
 		});
 
 		api.addEventListener("execution_start", ({ detail }) => {
+			this.nodeGrids = {}
 			this.runningNodeId = null;
 			this.lastExecutionError = null
 		});
@@ -982,6 +1040,106 @@ export class ComfyApp {
 		});
 
 		api.init();
+	}
+
+	/*
+	 * Based on inputs in the prompt marked as combinatorial,
+	 * construct a grid from the results
+	 */
+	#resolveGrid(outputNode, output, runningPrompt) {
+		let axes = []
+
+		const allImages = output.filter(batch => Array.isArray(batch.images))
+								.flatMap(batch => batch.images)
+
+		if (allImages.length === 0)
+			return null;
+
+		console.log("PROMPT", runningPrompt);
+		console.log("OUTPUT", output);
+
+		const isInputLink = (input) => {
+			return Array.isArray(input)
+				&& input.length === 2
+				&& typeof input[0] === "string"
+				&& typeof input[1] === "number";
+		}
+
+		// Axes closer to the output (executed later) are discovered first
+		const queue = [outputNode]
+		const seen = new Set();
+		while (queue.length > 0) {
+			const nodeID = queue.pop();
+			if (seen.has(nodeID))
+				continue;
+			seen.add(nodeID);
+			const promptInput = runningPrompt.output[nodeID];
+			const nodeClass = promptInput.class_type
+			console.warn("TRAVEL", nodeID, promptInput)
+
+			// Ensure input keys are sorted alphanumerically
+			// This is important for the plot to have the same order as
+			// it was executed on the backend
+			let sortedKeys = Object.keys(promptInput.inputs);
+			sortedKeys.sort((a, b) => a.localeCompare(b));
+
+			for (const inputName of sortedKeys) {
+				const input = promptInput.inputs[inputName];
+				if (typeof input === "object" && "__inputType__" in input) {
+					if (input.axis_id == null || !axes.some(a => a.id != null && a.id === input.axis_id)) {
+						let label = input.axis_name || `${nodeClass}: ${inputName}`;
+						axes.push({
+							id: input.axis_id,
+							nodeID,
+							nodeClass,
+							selectorID: `${nodeID}-${inputName}`.replace(" ", "-"),
+							label,
+							inputName,
+							values: input.values
+						})
+					}
+				}
+				else if (isInputLink(input)) {
+					const inputNodeID = input[0]
+					queue.push(inputNodeID)
+				}
+			}
+		}
+
+		axes = axes.reverse();
+
+		// Now divide up the image outputs
+		// Each axis will divide the full array of images by N, where N was the
+		// number of combinatorial choices for that axis, and this happens
+		// recursively for each axis
+
+		console.log("AXES", axes)
+
+		// Grid position
+		const currentCoords = Array.from(Array(0))
+
+		let images = allImages.map(i => { return {
+			image: i,
+			coords: []
+		}})
+
+		// TODO i don't know if this can generalize across arbitrary batch sizes
+		let factor = 1
+		let maxFactor = axes.map(a => a.values.length).reduce((s, l) => s * l, 1)
+		let batchFactor = images.length / maxFactor;
+
+		for (const axis of axes) {
+			factor *= axis.values.length;
+			for (const [index, image] of images.entries()) {
+				const coord = Math.floor((index / factor / batchFactor) * axis.values.length) % axis.values.length;
+				image.coords.push(coord);
+			}
+		}
+
+		const grid = { axes, images };
+		console.log("GRID", grid);
+
+		return grid;
 	}
 
 	#addKeyboardHandler() {
@@ -1244,7 +1402,7 @@ export class ComfyApp {
 				for (let widget of node.widgets) {
 					if (node.type == "KSampler" || node.type == "KSamplerAdvanced") {
 						if (widget.name == "sampler_name") {
-							if (widget.value.startsWith("sample_")) {
+							if (typeof widget.value === "string" && widget.value.startsWith("sample_")) {
 								widget.value = widget.value.slice(7);
 							}
 						}
@@ -1287,8 +1445,16 @@ export class ComfyApp {
 	async graphToPrompt() {
 		const workflow = this.graph.serialize();
 		const output = {};
+
+		let totalExecuted = 0;
+		let totalCombinatorialNodes = 0;
+		let executionFactor = 1;
+
 		// Process nodes in order of execution
-		for (const node of this.graph.computeExecutionOrder(false)) {
+		const executionOrder = Array.from(this.graph.computeExecutionOrder(false));
+		const executionOrderIds = executionOrder.map(n => n.id);
+
+		for (const node of executionOrder) {
 			const n = workflow.nodes.find((n) => n.id === node.id);
 
 			if (node.isVirtualNode) {
@@ -1312,7 +1478,13 @@ export class ComfyApp {
 				for (const i in widgets) {
 					const widget = widgets[i];
 					if (!widget.options || widget.options.serialize !== false) {
-						inputs[widget.name] = widget.serializeValue ? await widget.serializeValue(n, i) : widget.value;
+						const widgetValue = widget.serializeValue ? await widget.serializeValue(n, i) : widget.value;
+						inputs[widget.name] = widgetValue;
+						if (typeof widgetValue === "object" && widgetValue.__inputType__) {
+							totalCombinatorialNodes += 1;
+							executionFactor *= widgetValue.values.length;
+						}
+						totalExecuted += executionFactor;
 					}
 				}
 			}
@@ -1355,7 +1527,15 @@ export class ComfyApp {
 			}
 		}
 
-		return { workflow, output };
+		return {
+			prompt: {
+				workflow,
+				output,
+			},
+			executionOrder: executionOrderIds,
+			totalCombinatorialNodes,
+			totalExecuted
+		};
 	}
 
 	#formatPromptError(error) {
@@ -1405,17 +1585,25 @@ export class ComfyApp {
 
 		this.#processingQueue = true;
 		this.lastPromptError = null;
+		this.runningPrompt = null;
 
 		try {
 			while (this.#queueItems.length) {
 				({ number, batchCount } = this.#queueItems.pop());
 
 				for (let i = 0; i < batchCount; i++) {
-					const p = await this.graphToPrompt();
+					const result = await this.graphToPrompt();
+					const warnExecutedAmount = 256;
+					if (result.totalExecuted > warnExecutedAmount && !confirm("You are about to execute " + result.totalExecuted + " nodes total across " + result.totalCombinatorialNodes + " combinatorial axes. Are you sure you want to do this?")) {
+						continue
+					}
+					const p = result.prompt;
 
 					try {
+						this.runningPrompt = p;
 						await api.queuePrompt(number, p);
 					} catch (error) {
+						this.runningPrompt = null;
 						const formattedError = this.#formatPromptError(error)
 						this.ui.dialog.show(formattedError);
 						if (error.response) {
@@ -1524,10 +1712,14 @@ export class ComfyApp {
 	 */
 	clean() {
 		this.nodeOutputs = {};
+		this.nodeGrids = {};
 		this.nodePreviewImages = {}
+		this.progress = null;
+		this.batchProgress = null;
 		this.lastPromptError = null;
 		this.lastExecutionError = null;
 		this.runningNodeId = null;
+		this.runningPrompt = null;
 	}
 }
 

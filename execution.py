@@ -7,26 +7,232 @@ import heapq
 import traceback
 import gc
 import time
+import itertools
+import uuid
+from typing import List, Dict
+import dataclasses
+from dataclasses import dataclass
+from functools import cmp_to_key
 
 import torch
 import nodes
 
 import comfy.model_management
 
+
+@dataclass
+class CombinatorialBatches:
+    batches: List
+    input_to_index: Dict
+    index_to_values: Dict
+    indices: List
+    combinations: List
+
+
+def find(d, pred):
+    for i, x in d.items():
+        if pred(x):
+            return i, x
+    return None, None
+
+
+def is_combinatorial_graph_input(value):
+    return isinstance(value, dict) and "combinatorial" in value
+
+
+def get_input_data_batches(input_data_all):
+    """Given input data that can contain combinatorial input values, returns all
+    the possible batches that can be made by combining the different input
+    values together."""
+
+    input_to_index = {}
+    input_to_values = {}
+    index_to_values = []
+    input_to_axis = {}
+    index_to_coords = []
+
+    # Axis ID to inherit
+    inherit_id = True
+    axis_id = None
+
+    # Sort so the images can be reassociated on the frontend.
+    # Primitive inputs before previous outputs from other nodes, then alphanumerically
+    def sort_order(a, b):
+        a_value = input_data_all[a]
+        b_value = input_data_all[b]
+
+        if not (is_combinatorial_graph_input(a_value) and is_combinatorial_graph_input(b_value)):
+            if is_combinatorial_graph_input(a_value):
+                return 1
+            elif is_combinatorial_graph_input(b_value):
+                return -1
+            else:
+                return 1 if a > b else -1
+
+        if a_value["order"] == b_value["order"]:
+            return 1 if a > b else -1
+
+        return 1 if a_value["order"] > b_value["order"] else -1
+
+    sorted_input_names = sorted(input_data_all.keys(), key=cmp_to_key(sort_order))
+
+    from pprint import pp
+    print("SORTED")
+    pp(sorted_input_names)
+
+    for input_name in sorted_input_names:
+        value = input_data_all[input_name]
+        if is_combinatorial_graph_input(value):
+            if "axis_id" in value:
+                input_to_axis[input_name] = {
+                    "axis_id": value["axis_id"],
+                    "join_axis": value.get("join_axis", False)
+                }
+
+    i = 0
+
+    def add_index(input_name):
+        nonlocal i, input_data_all, input_to_index, index_to_coords
+        value = input_data_all[input_name]
+        input_to_index[input_name] = i
+        index_to_values.append(value["values"])
+        index_to_coords.append(list(range(len(value["values"]))))
+        ret = i
+        i += 1
+        return ret
+
+    for input_name in sorted_input_names:
+        value = input_data_all[input_name]
+        if is_combinatorial_graph_input(value):
+            if "axis_id" in value:
+                if axis_id is None:
+                    axis_id = value["axis_id"]
+                elif axis_id != value["axis_id"]:
+                    inherit_id = False
+
+                found_name = next((k for k, v in input_to_axis.items() if v["axis_id"] == value["axis_id"]), None)
+            else:
+                inherit_id = False
+                found_name = None
+
+            if found_name is not None:
+                join = input_to_axis[found_name]["join_axis"]
+                found_i = input_to_index.get(found_name)
+                if found_i is None:
+                    found_i = add_index(found_name)
+                input_to_index[input_name] = found_i
+                if not join:
+                    input_to_values[input_name] = value["values"]
+            else:
+                add_index(input_name)
+
+    if len(index_to_values) == 0:
+        # No combinatorial options.
+        return CombinatorialBatches([{ "inputs": input_data_all }], input_to_index, index_to_values, None, None)
+
+    batches = []
+
+    if not inherit_id or axis_id is None:
+        axis_id = str(uuid.uuid4())
+
+    indices = list(itertools.product(*index_to_coords))
+    combinations = list(itertools.product(*index_to_values))
+
+    pp(indices)
+
+    for i, indices_set in enumerate(indices):
+        combination = combinations[i]
+        batch = {}
+        for input_name, value in input_data_all.items():
+            if isinstance(value, dict) and "combinatorial" in value:
+                combination_index = input_to_index[input_name]
+                index = indices_set[combination_index]
+                if input_name in input_to_values:
+                    value = input_to_values[input_name][index]
+                else:
+                    value = combination[combination_index]
+                batch[input_name] = [value]
+            else:
+                # already made into a list by get_input_data
+                batch[input_name] = value
+        batches.append({
+            "inputs": batch,
+            "axis_id": axis_id
+        })
+
+    return CombinatorialBatches(batches, input_to_index, index_to_values, indices, combinations)
+
 def get_input_data(inputs, class_def, unique_id, outputs={}, prompt={}, extra_data={}):
+    """Given input data from the prompt, returns a list of input data dicts for
+    each combinatorial batch."""
     valid_inputs = class_def.INPUT_TYPES()
     input_data_all = {}
     for x in inputs:
         input_data = inputs[x]
+        required_or_optional = ("required" in valid_inputs and x in valid_inputs["required"]) or ("optional" in valid_inputs and x in valid_inputs["optional"])
         if isinstance(input_data, list):
             input_unique_id = input_data[0]
             output_index = input_data[1]
             if input_unique_id not in outputs:
                 return None
-            obj = outputs[input_unique_id][output_index]
-            input_data_all[x] = obj
+
+            output_data = outputs[input_unique_id]
+
+            # This is a list of outputs for each batch of combinatorial inputs.
+            # Without any combinatorial inputs, it's a list of length 1.
+            outputs_for_all_batches = output_data["batches"]
+
+            def flatten(list_of_lists):
+                return list(itertools.chain.from_iterable(list_of_lists))
+
+            if len(outputs_for_all_batches) == 1:
+                # Single batch, no combinatorial stuff
+                input_data_all[x] = outputs_for_all_batches[0][output_index]
+            else:
+                from pprint import pp
+                print("GETINPUTDATA")
+                print(x)
+                print(input_unique_id)
+                # Make the outputs into a list for map-over-list use
+                # (they are themselves lists so flatten them afterwards)
+                input_values = [batch_output[output_index] for batch_output in outputs_for_all_batches]
+                input_values = {
+                    "combinatorial": True,
+                    "values": flatten(input_values),
+
+                    # always treat multiple outputs from a node as belonging to
+                    # the same grid "axis". situation this is supposed to prevent:
+                    #
+                    # LoraLoader outputs both a modified CLIP and MODEL. to
+                    # ensure the outputs are enumerated combinatorially with
+                    # others, they should be marked combinatorial.
+                    #
+                    # however, this does *not* mean the executor should
+                    # enumerate every combination of CLIP and MODEL that can
+                    # possibly be output *from the same node*. as in, the CLIP
+                    # from one set of LoRA weights being combined with the MODEL
+                    # from a different set of weights, as you'd never encounter
+                    # that combination with regular use of the LoraLoader node.
+                    #
+                    # thus if a combinatorial set of outputs is detected, group
+                    # them under the same axis so each of the outputs are
+                    # updated in pairs/triplets/etc. instead of combinatorially
+                    "axis_id": output_data["axis_id"],
+                    "order": output_data["execution_order"]
+                }
+                input_data_all[x] = input_values
+                print("--------------------")
+        elif is_combinatorial_input(input_data):
+            if required_or_optional:
+                input_data_all[x] = {
+                    "combinatorial": True,
+                    "values": input_data["values"],
+                    "axis_id": input_data.get("axis_id"),
+                    "is_output": False,
+                    "order": -1 # inputs go before outputs
+                }
         else:
-            if ("required" in valid_inputs and x in valid_inputs["required"]) or ("optional" in valid_inputs and x in valid_inputs["optional"]):
+            if required_or_optional:
                 input_data_all[x] = [input_data]
 
     if "hidden" in valid_inputs:
@@ -39,68 +245,161 @@ def get_input_data(inputs, class_def, unique_id, outputs={}, prompt={}, extra_da
                     input_data_all[x] = [extra_data['extra_pnginfo']]
             if h[x] == "UNIQUE_ID":
                 input_data_all[x] = [unique_id]
-    return input_data_all
 
-def map_node_over_list(obj, input_data_all, func, allow_interrupt=False):
-    # check if node wants the lists
-    intput_is_list = False
-    if hasattr(obj, "INPUT_IS_LIST"):
-        intput_is_list = obj.INPUT_IS_LIST
+    input_data_all_batches = get_input_data_batches(input_data_all)
 
-    max_len_input = max([len(x) for x in input_data_all.values()])
-     
-    # get a slice of inputs, repeat last input when list isn't long enough
-    def slice_dict(d, i):
-        d_new = dict()
+    def format_dict(d):
+        s = []
         for k,v in d.items():
-            d_new[k] = v[i if len(v) > i else -1]
-        return d_new
-    
+            st = f"{k}: "
+            if isinstance(v, list):
+                st += f"list[len: {len(v)}]["
+                i = []
+                for v2 in v:
+                    if isinstance(v2, (int, float, bool)):
+                        i.append(str(v2))
+                    else:
+                        i.append(v2.__class__.__name__)
+                st += ",".join(i) + "]"
+            else:
+                if isinstance(v, (int, float, bool)):
+                    st += str(v)
+                else:
+                    st += str(type(v))
+            s.append(st)
+        return "( " + ", ".join(s) + " )"
+
+    print("---------------------------------")
+    from pprint import pp
+    for batch in input_data_all_batches.batches:
+        print(format_dict(batch["inputs"]))
+    # pp(input_data_all)
+    # pp(input_data_all_batches.batches)
+    print(input_data_all_batches.input_to_index)
+    # print(input_data_all_batches.index_to_values)
+    print("---------------------------------")
+
+    return input_data_all_batches
+
+def slice_lists_into_dict(d, i):
+    """
+    get a slice of inputs, repeat last input when list isn't long enough
+    d={ "seed": [ 1, 2, 3 ], "steps": [ 4, 8 ] }, i=2 -> { "seed": 3, "steps": 8 }
+    """
+    d_new = {}
+    for k, v in d.items():
+        d_new[k] = v[i if len(v) > i else -1]
+    return d_new
+
+def map_node_over_list(obj, input_data_all, func, allow_interrupt=False, callback=None):
+    # check if node wants the lists
+    input_is_list = False
+    if hasattr(obj, "INPUT_IS_LIST"):
+        input_is_list = obj.INPUT_IS_LIST
+
+    max_len_input = max(len(x) for x in input_data_all.values())
+
     results = []
-    if intput_is_list:
+    if input_is_list:
         if allow_interrupt:
             nodes.before_node_execution()
         results.append(getattr(obj, func)(**input_data_all))
-    else: 
+    else:
         for i in range(max_len_input):
             if allow_interrupt:
                 nodes.before_node_execution()
-            results.append(getattr(obj, func)(**slice_dict(input_data_all, i)))
+            results.append(getattr(obj, func)(**slice_lists_into_dict(input_data_all, i)))
+            if callback is not None:
+                callback(i + 1, max_len_input)
     return results
 
-def get_output_data(obj, input_data_all):
-    
-    results = []
-    uis = []
-    return_values = map_node_over_list(obj, input_data_all, obj.FUNCTION, allow_interrupt=True)
+def get_output_data(obj, input_data_all_batches, server, unique_id, prompt_id):
+    all_outputs = []
+    all_outputs_ui = []
+    axis_id = None
+    total_batches = len(input_data_all_batches.batches)
 
-    for r in return_values:
-        if isinstance(r, dict):
-            if 'ui' in r:
-                uis.append(r['ui'])
-            if 'result' in r:
-                results.append(r['result'])
-        else:
-            results.append(r)
-    
-    output = []
-    if len(results) > 0:
-        # check which outputs need concatenating
-        output_is_list = [False] * len(results[0])
-        if hasattr(obj, "OUTPUT_IS_LIST"):
-            output_is_list = obj.OUTPUT_IS_LIST
+    total_inner_batches = 0
+    for batch in input_data_all_batches.batches:
+        total_inner_batches += max(len(x) for x in batch["inputs"].values())
 
-        # merge node execution results
-        for i, is_list in zip(range(len(results[0])), output_is_list):
-            if is_list:
-                output.append([x for o in results for x in o[i]])
+    inner_totals = 0
+
+    def send_batch_progress(inner_num):
+        if server.client_id is not None:
+            message = {
+                "node": unique_id,
+                "prompt_id": prompt_id,
+                "batch_num": inner_totals + inner_num,
+                "total_batches": total_inner_batches
+            }
+            server.send_sync("batch_progress", message, server.client_id)
+
+    send_batch_progress(0)
+
+    for batch_num, batch in enumerate(input_data_all_batches.batches):
+        def cb(inner_num, inner_total):
+            send_batch_progress(inner_num)
+
+        batch_inputs = batch["inputs"]
+        return_values = map_node_over_list(obj, batch_inputs, obj.FUNCTION, allow_interrupt=True, callback=cb)
+
+        if axis_id is None and "axis_id" in batch:
+            axis_id = batch["axis_id"]
+
+        inner_totals += max(len(x) for x in batch_inputs.values())
+
+        uis = []
+        results = []
+
+        for r in return_values:
+            if isinstance(r, dict):
+                if 'ui' in r:
+                    uis.append(r['ui'])
+                if 'result' in r:
+                    results.append(r['result'])
             else:
-                output.append([o[i] for o in results])
+                results.append(r)
 
-    ui = dict()    
-    if len(uis) > 0:
-        ui = {k: [y for x in uis for y in x[k]] for k in uis[0].keys()}
-    return output, ui
+        output = []
+        if len(results) > 0:
+            # check which outputs need concatenating
+            output_is_list = [False] * len(results[0])
+            if hasattr(obj, "OUTPUT_IS_LIST"):
+                output_is_list = obj.OUTPUT_IS_LIST
+
+            # merge node execution results
+            for i, is_list in zip(range(len(results[0])), output_is_list):
+                if is_list:
+                    output.append([x for o in results for x in o[i]])
+                else:
+                    output.append([o[i] for o in results])
+
+        output_ui = None
+        if len(uis) > 0:
+            output_ui = {k: [y for x in uis for y in x[k]] for k in uis[0].keys()}
+
+        all_outputs.append(output)
+        all_outputs_ui.append(output_ui)
+
+        outputs_ui_to_send = None
+        if any(all_outputs_ui):
+            outputs_ui_to_send = all_outputs_ui
+
+        # update the UI after each batch finishes
+        if server.client_id is not None:
+            message = {
+                "node": unique_id,
+                "output": outputs_ui_to_send,
+                "prompt_id": prompt_id,
+                "batch_num": inner_totals,
+                "total_batches": total_inner_batches
+            }
+            if input_data_all_batches.indices:
+                message["indices"] = input_data_all_batches.indices[batch_num]
+            server.send_sync("executed", message, server.client_id)
+
+    return all_outputs, all_outputs_ui, axis_id
 
 def format_value(x):
     if x is None:
@@ -110,7 +409,7 @@ def format_value(x):
     else:
         return str(x)
 
-def recursive_execute(server, prompt, outputs, current_item, extra_data, executed, prompt_id, outputs_ui):
+def recursive_execute(server, prompt, outputs, current_item, extra_data, executed, prompt_id, outputs_ui, exec_order):
     unique_id = current_item
     inputs = prompt[unique_id]['inputs']
     class_type = prompt[unique_id]['class_type']
@@ -125,25 +424,41 @@ def recursive_execute(server, prompt, outputs, current_item, extra_data, execute
             input_unique_id = input_data[0]
             output_index = input_data[1]
             if input_unique_id not in outputs:
-                result = recursive_execute(server, prompt, outputs, input_unique_id, extra_data, executed, prompt_id, outputs_ui)
+                result = recursive_execute(server, prompt, outputs, input_unique_id, extra_data, executed, prompt_id, outputs_ui, exec_order + 1)
                 if result[0] is not True:
                     # Another node failed further upstream
                     return result
 
-    input_data_all = None
+    input_data_all_batches = None
     try:
-        input_data_all = get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
+        input_data_all_batches = get_input_data(inputs, class_def, unique_id, outputs, prompt, extra_data)
         if server.client_id is not None:
             server.last_node_id = unique_id
-            server.send_sync("executing", { "node": unique_id, "prompt_id": prompt_id }, server.client_id)
+            combinations = None
+            if input_data_all_batches.indices:
+                combinations = {
+                    "input_to_index": input_data_all_batches.input_to_index,
+                    "indices": input_data_all_batches.indices
+                }
+            mes = {
+                "node": unique_id,
+                "prompt_id": prompt_id,
+                "combinations": combinations
+            }
+            server.send_sync("executing", mes, server.client_id)
+
         obj = class_def()
 
-        output_data, output_ui = get_output_data(obj, input_data_all)
-        outputs[unique_id] = output_data
-        if len(output_ui) > 0:
-            outputs_ui[unique_id] = output_ui
-            if server.client_id is not None:
-                server.send_sync("executed", { "node": unique_id, "output": output_ui, "prompt_id": prompt_id }, server.client_id)
+        output_data_from_batches, output_ui_from_batches, output_axis_id = get_output_data(obj, input_data_all_batches, server, unique_id, prompt_id)
+        outputs[unique_id] = {
+            "batches": output_data_from_batches,
+            "axis_id": output_axis_id,
+            "execution_order": exec_order
+        }
+        if any(output_ui_from_batches):
+            outputs_ui[unique_id] = output_ui_from_batches
+        elif unique_id in outputs_ui:
+            outputs_ui.pop(unique_id)
     except comfy.model_management.InterruptProcessingException as iex:
         print("Processing interrupted")
 
@@ -156,18 +471,24 @@ def recursive_execute(server, prompt, outputs, current_item, extra_data, execute
     except Exception as ex:
         typ, _, tb = sys.exc_info()
         exception_type = full_type_name(typ)
-        input_data_formatted = {}
-        if input_data_all is not None:
-            input_data_formatted = {}
-            for name, inputs in input_data_all.items():
-                input_data_formatted[name] = [format_value(x) for x in inputs]
-
-        output_data_formatted = {}
-        for node_id, node_outputs in outputs.items():
-            output_data_formatted[node_id] = [[format_value(x) for x in l] for l in node_outputs]
 
         print("!!! Exception during processing !!!")
         print(traceback.format_exc())
+
+        input_data_formatted = []
+        if input_data_all_batches is not None:
+            d = {}
+            for batch in input_data_all_batches.batches:
+                for name, inputs in batch["inputs"].items():
+                    d[name] = [format_value(x) for x in inputs]
+                input_data_formatted.append(d)
+
+        output_data_formatted = []
+        for node_id, node_outputs in outputs.items():
+            d = {}
+            for batch_outputs in node_outputs:
+                d[node_id] = [[format_value(x) for x in l] for l in batch_outputs]
+            output_data_formatted.append(d)
 
         error_details = {
             "node_id": unique_id,
@@ -213,13 +534,16 @@ def recursive_output_delete_if_changed(prompt, old_prompt, outputs, current_item
         if unique_id in old_prompt and 'is_changed' in old_prompt[unique_id]:
             is_changed_old = old_prompt[unique_id]['is_changed']
         if 'is_changed' not in prompt[unique_id]:
-            input_data_all = get_input_data(inputs, class_def, unique_id, outputs)
-            if input_data_all is not None:
-                try:
+            input_data_all_batches = get_input_data(inputs, class_def, unique_id, outputs)
+            if input_data_all_batches is not None:
+                 try:
                     #is_changed = class_def.IS_CHANGED(**input_data_all)
-                    is_changed = map_node_over_list(class_def, input_data_all, "IS_CHANGED")
+                    for batch in input_data_all_batches.batches:
+                        if map_node_over_list(class_def, batch["inputs"], "IS_CHANGED"):
+                            is_changed = True
+                            break
                     prompt[unique_id]['is_changed'] = is_changed
-                except:
+                 except:
                     to_delete = True
         else:
             is_changed = prompt[unique_id]['is_changed']
@@ -350,7 +674,7 @@ class PromptExecutor:
                 # This call shouldn't raise anything if there's an error deep in
                 # the actual SD code, instead it will report the node where the
                 # error was raised
-                success, error, ex = recursive_execute(self.server, prompt, self.outputs, output_node_id, extra_data, executed, prompt_id, self.outputs_ui)
+                success, error, ex = recursive_execute(self.server, prompt, self.outputs, output_node_id, extra_data, executed, prompt_id, self.outputs_ui, 0)
                 if success is not True:
                     self.handle_execution_error(prompt_id, prompt, current_outputs, executed, error, ex)
                     break
@@ -364,6 +688,94 @@ class PromptExecutor:
         print("Prompt executed in {:.2f} seconds".format(time.perf_counter() - execution_start_time))
         gc.collect()
         comfy.model_management.soft_empty_cache()
+
+
+def is_combinatorial_input(val):
+    return isinstance(val, dict) and "__inputType__" in val
+
+
+def get_raw_inputs(raw_val):
+    if isinstance(raw_val, list):
+        # link to another node
+        return [raw_val]
+    elif is_combinatorial_input(raw_val):
+        return raw_val["values"]
+    return [raw_val]
+
+
+def clamp_input(val, info, class_type, obj_class, x):
+    errors = []
+
+    if is_combinatorial_input(val):
+        if len(val["values"]) == 0:
+            error = {
+                "type": "combinatorial_input_missing_values",
+                "message": f"Combinatorial input has no values in its list.",
+                "details": f"{x}",
+                "extra_info": {
+                    "input_name": x,
+                    "input_config": info,
+                    "received_value": val,
+                }
+            }
+            return (False, None, error)
+        for i, val_choice in enumerate(val["values"]):
+            r = clamp_input(val_choice, info, class_type, obj_class, x)
+            if r[0] == False:
+                return r
+            val["values"][i] = r[1]
+        return (True, val, None)
+
+    type_input = info[0]
+
+    try:
+        if type_input == "INT":
+            val = int(val)
+        if type_input == "FLOAT":
+            val = float(val)
+        if type_input == "STRING":
+            val = str(val)
+    except Exception as ex:
+        error = {
+            "type": "invalid_input_type",
+            "message": f"Failed to convert an input value to a {type_input} value",
+            "details": f"{x}, {val}, {ex}",
+            "extra_info": {
+                "input_name": x,
+                "input_config": info,
+                "received_value": val,
+                "exception_message": str(ex)
+            }
+        }
+        return (False, None, error)
+
+    if len(info) > 1:
+        if "min" in info[1] and val < info[1]["min"]:
+            error = {
+                "type": "value_smaller_than_min",
+                "message": "Value {} smaller than min of {}".format(val, info[1]["min"]),
+                "details": f"{x}",
+                "extra_info": {
+                    "input_name": x,
+                    "input_config": info,
+                    "received_value": val,
+                }
+            }
+            return (False, None, error)
+        if "max" in info[1] and val > info[1]["max"]:
+            error = {
+                "type": "value_bigger_than_max",
+                "message": "Value {} bigger than max of {}".format(val, info[1]["max"]),
+                "details": f"{x}",
+                "extra_info": {
+                    "input_name": x,
+                    "input_config": info,
+                    "received_value": val,
+                }
+            }
+            return (False, None, error)
+
+    return (True, val, None)
 
 
 def validate_inputs(prompt, item, validated):
@@ -457,107 +869,65 @@ def validate_inputs(prompt, item, validated):
                 validated[o_id] = (False, reasons, o_id)
                 continue
         else:
-            try:
-                if type_input == "INT":
-                    val = int(val)
-                    inputs[x] = val
-                if type_input == "FLOAT":
-                    val = float(val)
-                    inputs[x] = val
-                if type_input == "STRING":
-                    val = str(val)
-                    inputs[x] = val
-            except Exception as ex:
-                error = {
-                    "type": "invalid_input_type",
-                    "message": f"Failed to convert an input value to a {type_input} value",
-                    "details": f"{x}, {val}, {ex}",
-                    "extra_info": {
-                        "input_name": x,
-                        "input_config": info,
-                        "received_value": val,
-                        "exception_message": str(ex)
-                    }
-                }
-                errors.append(error)
+            r = clamp_input(val, info, class_type, obj_class, x)
+            if r[0] == False:
+                errors.append(r[2])
                 continue
-
-            if len(info) > 1:
-                if "min" in info[1] and val < info[1]["min"]:
-                    error = {
-                        "type": "value_smaller_than_min",
-                        "message": "Value {} smaller than min of {}".format(val, info[1]["min"]),
-                        "details": f"{x}",
-                        "extra_info": {
-                            "input_name": x,
-                            "input_config": info,
-                            "received_value": val,
-                        }
-                    }
-                    errors.append(error)
-                    continue
-                if "max" in info[1] and val > info[1]["max"]:
-                    error = {
-                        "type": "value_bigger_than_max",
-                        "message": "Value {} bigger than max of {}".format(val, info[1]["max"]),
-                        "details": f"{x}",
-                        "extra_info": {
-                            "input_name": x,
-                            "input_config": info,
-                            "received_value": val,
-                        }
-                    }
-                    errors.append(error)
-                    continue
+            else:
+                inputs[x] = r[1]
 
             if hasattr(obj_class, "VALIDATE_INPUTS"):
-                input_data_all = get_input_data(inputs, obj_class, unique_id)
+                input_data_all_batches = get_input_data(inputs, obj_class, unique_id)
                 #ret = obj_class.VALIDATE_INPUTS(**input_data_all)
-                ret = map_node_over_list(obj_class, input_data_all, "VALIDATE_INPUTS")
-                for i, r in enumerate(ret):
-                    if r is not True:
-                        details = f"{x}"
-                        if r is not False:
-                            details += f" - {str(r)}"
+                for batch in input_data_all_batches.batches:
+                    ret = map_node_over_list(obj_class, batch["inputs"], "VALIDATE_INPUTS")
+                    for r in ret:
+                        if r != True:
+                            details = f"{x}"
+                            if r is not False:
+                                details += f" - {str(r)}"
 
-                        error = {
-                            "type": "custom_validation_failed",
-                            "message": "Custom validation failed for node",
-                            "details": details,
-                            "extra_info": {
-                                "input_name": x,
-                                "input_config": info,
-                                "received_value": val,
+                            error = {
+                                "type": "custom_validation_failed",
+                                "message": "Custom validation failed for node",
+                                "details": details,
+                                "extra_info": {
+                                    "input_name": x,
+                                    "input_config": info,
+                                    "received_value": val,
+                                }
                             }
-                        }
-                        errors.append(error)
-                        continue
+                            errors.append(error)
+                            continue
             else:
                 if isinstance(type_input, list):
-                    if val not in type_input:
-                        input_config = info
-                        list_info = ""
+                    # Account for more than one combinatorial value
+                    raw_vals = get_raw_inputs(val)
+                    for raw_val in raw_vals:
+                        if raw_val not in type_input:
+                            input_config = info
+                            list_info = ""
 
-                        # Don't send back gigantic lists like if they're lots of
-                        # scanned model filepaths
-                        if len(type_input) > 20:
-                            list_info = f"(list of length {len(type_input)})"
-                            input_config = None
-                        else:
-                            list_info = str(type_input)
+                            # Don't send back gigantic lists like if they're lots of
+                            # scanned model filepaths
+                            if len(type_input) > 20:
+                                list_info = f"(list of length {len(type_input)})"
+                                input_config = None
+                            else:
+                                list_info = str(type_input)
 
-                        error = {
-                            "type": "value_not_in_list",
-                            "message": "Value not in list",
-                            "details": f"{x}: '{val}' not in {list_info}",
-                            "extra_info": {
-                                "input_name": x,
-                                "input_config": input_config,
-                                "received_value": val,
+                            error = {
+                                "type": "value_not_in_list",
+                                "message": "Value not in list",
+                                "details": f"{x}: '{raw_val}' not in {list_info}",
+                                "extra_info": {
+                                    "input_name": x,
+                                    "input_config": input_config,
+                                    "received_value": raw_val,
+                                }
                             }
-                        }
-                        errors.append(error)
-                        continue
+                            errors.append(error)
+                            continue
 
     if len(errors) > 0 or valid is not True:
         ret = (False, errors, unique_id)
